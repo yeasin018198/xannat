@@ -1,4 +1,6 @@
-pyrogram==2.0.106
-tgcrypto==1.2.5
-motor==3.3.2
-aiohttp==3.9.5
+pyrogram
+tgcrypto
+motor
+aiohttp
+requests
+dnspython
