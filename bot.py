@@ -22,11 +22,11 @@ from pyrogram.types import (
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # ---------------- CONFIGURATION / ENV VARIABLES ---------------- #
-API_ID = int(os.environ.get("API_ID", "1234567"))
-API_HASH = os.environ.get("API_HASH", "your_api_hash")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token")
-OWNER_ID = int(os.environ.get("OWNER_ID", "12345678"))
-MONGO_URI = os.environ.get("MONGO_URI", "your_mongodb_uri")
+API_ID = int(os.environ.get("API_ID", "29904834"))
+API_HASH = os.environ.get("API_HASH", "8b4fd9ef578af114502feeafa2d31938")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8915927925:AAGCRPRRqniqN9JMe-nr8JneEjTkFFcFlNg")
+OWNER_ID = int(os.environ.get("OWNER_ID", "7120801813"))
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://FlixBixs:FlixBixs@cluster0.awkvdsd.mongodb.net/?appName=Cluster0")
 PORT = int(os.environ.get("PORT", "8080"))
 
 # ---------------- DATABASE CONNECTION ---------------- #
