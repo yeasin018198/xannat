@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import json
 import uuid
 import secrets
 import asyncio
@@ -57,7 +58,7 @@ app = Client(
 # ---------------- EMBEDDED WEB SERVER (FOR KOYEB & RENDER PORT BINDING) ---------------- #
 async def web_server():
     async def handle_ping(request):
-        return web.Response(text="Bot is running smoothly on Koyeb/Render!")
+        return web.Response(text="Bot is running smoothly on Koyeb/Render 24/7!")
     server_app = web.Application()
     server_app.router.add_get("/", handle_ping)
     runner = web.AppRunner(server_app)
@@ -77,6 +78,22 @@ async def remove_webhook_if_exists():
     except Exception as e:
         print(f"⚠️ Webhook removal error: {e}")
 
+# ---------------- AUTO UPTIME PINGER (EVERY 30 SECONDS) ---------------- #
+async def auto_uptime_pinger():
+    """আপটাইম রোবটের মতো প্রতি ৩০ সেকেন্ড পর পর কমান্ড দিয়ে সেট করা সাইট URL-এ পিং করবে"""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            settings = await settings_col.find_one({"_id": "config"})
+            if settings:
+                target_url = settings.get("ping_url")
+                if target_url and str(target_url).startswith("http"):
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(target_url, timeout=10) as resp:
+                            pass
+        except Exception:
+            pass
+
 # ---------------- CORE HELPER FUNCTIONS ---------------- #
 async def get_settings():
     settings = await settings_col.find_one({"_id": "config"})
@@ -90,7 +107,8 @@ async def get_settings():
             "protect_content": False,
             "getfile_channel": None,
             "auto_delete_time": 0,
-            "files_per_request": 1  # ডিফল্টভাবে প্রতি ক্লিকে ১টি করে ফাইল যাবে
+            "files_per_request": 1,  # ডিফল্টভাবে প্রতি ক্লিকে ১টি করে ফাইল যাবে
+            "ping_url": None
         }
         await settings_col.insert_one(default)
         return default
@@ -190,7 +208,7 @@ def get_must_join_markup(unjoined_channels):
     buttons.append([InlineKeyboardButton("🔄 জয়েন সম্পন্ন করেছি (Try Again)", callback_data="check_join_again")])
     return InlineKeyboardMarkup(buttons)
 
-# ---------------- SHORTLINK GENERATOR (MULTI-DOMAIN ROTATION) ---------------- #
+# ---------------- UNIVERSAL SHORTLINK GENERATOR (CUSTOM, WORDPRESS & ALL APIS) ---------------- #
 async def generate_shortlink(user_id: int, bot_username: str, action: str = "general"):
     shorteners = await shorteners_col.find().to_list(length=100)
     if not shorteners:
@@ -211,19 +229,55 @@ async def generate_shortlink(user_id: int, bot_username: str, action: str = "gen
     })
 
     long_url = f"https://t.me/{bot_username}?start=verify_{token}"
-    api_url = f"https://{selected['domain']}/api?api={selected['api']}&url={long_url}"
+
+    raw_domain = selected['domain'].strip()
+    api_key = selected['api'].strip()
+
+    # ইউনিভার্সাল লিংক ফরম্যাটিং (ওয়ার্ডপ্রেস, AdLinkFly বা কাস্টম যেকোনাে এপিআই সাপোর্ট করবে)
+    if raw_domain.startswith("http://") or raw_domain.startswith("https://"):
+        base_endpoint = raw_domain
+    else:
+        base_endpoint = f"https://{raw_domain}"
+
+    if not ("/api" in base_endpoint or "?" in base_endpoint):
+        base_endpoint = base_endpoint.rstrip("/") + "/api"
+
+    connector = "&" if "?" in base_endpoint else "?"
+    api_url = f"{base_endpoint}{connector}api={api_key}&url={long_url}"
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(api_url, timeout=10) as resp:
-                data = await resp.json()
-                if "shortenedUrl" in data:
-                    return data["shortenedUrl"], token
-                elif "url" in data:
-                    return data["url"], token
+            async with session.get(api_url, timeout=12) as resp:
+                text_response = await resp.text()
+
+                # ১. JSON রেসপন্স ফিল্টারিং
+                try:
+                    data = json.loads(text_response)
+                    if isinstance(data, dict):
+                        if "shortenedUrl" in data and data["shortenedUrl"]:
+                            return data["shortenedUrl"], token
+                        elif "url" in data and data["url"]:
+                            return data["url"], token
+                        elif "short" in data and data["short"]:
+                            return data["short"], token
+                        elif "link" in data and data["link"]:
+                            return data["link"], token
+                        elif "result" in data and data["result"]:
+                            return data["result"], token
+                        elif "data" in data and isinstance(data["data"], dict) and "url" in data["data"]:
+                            return data["data"]["url"], token
+                except Exception:
+                    pass
+
+                # ২. প্লেন টেক্সট রেসপন্স ফিল্টারিং (অনেক ওয়ার্ডপ্রেস প্লাগইন সরাসরি লিংক টেক্সট হিসেবে পাঠায়)
+                cleaned_text = text_response.strip().strip('"').strip("'")
+                if cleaned_text.startswith("http://") or cleaned_text.startswith("https://"):
+                    return cleaned_text, token
+
     except Exception as e:
         print(f"Shortlink API Error: {e}")
-    return long_url, token
+
+    return None, token
 
 # ---------------- BATCH & SEQUENTIAL FILE SENDER (NO BUTTONS, PURE FILE) ---------------- #
 async def send_batch_serial_videos(client: Client, user_id: int, channel_id: int, start_serial: int):
@@ -288,23 +342,33 @@ async def handle_category_request(client: Client, user_id: int, channel_id: int,
     user_doc = await users_col.find_one({"_id": user_id})
     current_pointer = user_doc.get("video_pointer", {}).get(str(channel_id), 1) if user_doc else 1
 
-    # সাধারণ ইউজার হলে প্রতিবারই বাধ্যতামূলক ভেরিফাই লিংক আসবে (বিজ্ঞাপন ইনকাম নিশ্চিতকরণ)
+    # সাধারণ ইউজার হলে প্রতিবারই বাধ্যতামূলক ভেরিফাই শর্ট লিংক আসবে (ইনকাম নিশ্চিতকরণ)
     if not is_premium:
         me = await client.get_me()
         short_url, _ = await generate_shortlink(user_id, me.username, action=f"cat_{channel_id}")
-        if short_url:
-            btn = InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"🔓 {batch_count}টি ফাইল আনলক করুন", url=short_url)],
-                [InlineKeyboardButton("💎 প্রিমিয়াম নিন (বিজ্ঞাপনহীন)", url=f"https://t.me/{settings['admin_contact'].replace('@', '')}")]
-            ])
-            text = (
-                f"🔒 **{current_pointer} নম্বর পর্ব থেকে মোট {batch_count}টি ফাইল দেখতে ভেরিফাই করুন!**\n\n"
-                "👉 নিচের লিংকে গিয়ে ভেরিফিকেশন সম্পন্ন করলেই ফাইল সাথে সাথে ইনবক্সে চলে আসবে।\n"
-                "💎 প্রিমিয়াম মেম্বারদের কোনো বিজ্ঞাপন বা ভেরিফাই করতে হয় না।"
+        
+        # কোনো কারণে শর্টনার না থাকলে বা ব্যর্থ হলে কখনই ডিরেক্ট ফাইল যাবে না
+        if not short_url:
+            err_msg = (
+                "⚠️ **শর্টনার সংযোগ পাওয়া যায়নি!**\n\n"
+                "এডমিন এখনো কোনো শর্টনার লিংক যোগ করেননি অথবা এপিআই কি সঠিক নয়। দয়া করে এডমিনের সাথে যোগাযোগ করুন।"
             )
             if isinstance(message_or_query, CallbackQuery):
-                return await message_or_query.message.reply_text(text, reply_markup=btn)
-            return await message_or_query.reply_text(text, reply_markup=btn)
+                return await message_or_query.answer(err_msg, show_alert=True)
+            return await message_or_query.reply_text(err_msg)
+
+        btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"🔓 {batch_count}টি ফাইল আনলক করুন", url=short_url)],
+            [InlineKeyboardButton("💎 প্রিমিয়াম নিন (বিজ্ঞাপনহীন)", url=f"https://t.me/{settings['admin_contact'].replace('@', '')}")]
+        ])
+        text = (
+            f"🔒 **{current_pointer} নম্বর পর্ব থেকে মোট {batch_count}টি ফাইল দেখতে ভেরিফাই করুন!**\n\n"
+            "👉 নিচের লিংকে গিয়ে ভেরিফিকেশন সম্পন্ন করলেই ফাইল সাথে সাথে ইনবক্সে চলে আসবে।\n"
+            "💎 প্রিমিয়াম মেম্বারদের কোনো বিজ্ঞাপন বা ভেরিফাই করতে হয় না।"
+        )
+        if isinstance(message_or_query, CallbackQuery):
+            return await message_or_query.message.reply_text(text, reply_markup=btn)
+        return await message_or_query.reply_text(text, reply_markup=btn)
 
     # প্রিমিয়াম হলে সরাসরি ভিডিও পাবে (স্টার্ট মেন্যুর বাটন কখনই ডিলিট হবে না)
     await send_batch_serial_videos(client, user_id, channel_id, current_pointer)
@@ -339,18 +403,24 @@ async def handle_special_getfile_request(client: Client, user_id: int, message_o
     if not is_premium:
         me = await client.get_me()
         short_url, _ = await generate_shortlink(user_id, me.username, action="special_getfile")
-        if short_url:
-            btn = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔓 স্পেশাল ফাইল আনলক করুন", url=short_url)],
-                [InlineKeyboardButton("💎 প্রিমিয়াম নিন (বিজ্ঞাপনহীন)", url=f"https://t.me/{settings['admin_contact'].replace('@', '')}")]
-            ])
-            text = (
-                "🔒 **স্পেশাল ফাইল পেতে হলে একটি ভেরিফিকেশন সম্পন্ন করুন!**\n\n"
-                "👉 নিচের আনলক লিংকে গিয়ে ভেরিফাই সম্পন্ন করুন, ফাইল সাথে সাথে পেয়ে যাবেন।"
-            )
+        
+        if not short_url:
+            err_msg = "⚠️ শর্টনার যুক্ত করা নেই বা এপিআই কাজ করছে না! এডমিনের সাথে যোগাযোগ করুন।"
             if isinstance(message_or_query, CallbackQuery):
-                return await message_or_query.message.reply_text(text, reply_markup=btn)
-            return await message_or_query.reply_text(text, reply_markup=btn)
+                return await message_or_query.answer(err_msg, show_alert=True)
+            return await message_or_query.reply_text(err_msg)
+
+        btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔓 স্পেশাল ফাইল আনলক করুন", url=short_url)],
+            [InlineKeyboardButton("💎 প্রিমিয়াম নিন (বিজ্ঞাপনহীন)", url=f"https://t.me/{settings['admin_contact'].replace('@', '')}")]
+        ])
+        text = (
+            "🔒 **স্পেশাল ফাইল পেতে হলে একটি ভেরিফিকেশন সম্পন্ন করুন!**\n\n"
+            "👉 নিচের আনলক লিংকে গিয়ে ভেরিফাই সম্পন্ন করুন, ফাইল সাথে সাথে পেয়ে যাবেন।"
+        )
+        if isinstance(message_or_query, CallbackQuery):
+            return await message_or_query.message.reply_text(text, reply_markup=btn)
+        return await message_or_query.reply_text(text, reply_markup=btn)
 
     # প্রিমিয়াম ইউজার সরাসরি ফাইল পাবে (কোনো বাটন ছাড়া)
     try:
@@ -481,6 +551,34 @@ async def setcmd_handler(client: Client, message: Message):
         "এখন চ্যাটে যেকোনো ইউজার `/` চাপলেই কমান্ডগুলোর তালিকা দেখতে পাবে।"
     )
 
+# ---------------- /setping COMMAND (স্বয়ংক্রিয় আপটাইম রোবট) ---------------- #
+@app.on_message(filters.command("setping") & filters.user(OWNER_ID))
+async def setping_handler(client: Client, message: Message):
+    args = message.text.split()
+    if len(args) < 2:
+        settings = await get_settings()
+        curr = settings.get("ping_url", "কোনো URL সেট করা নেই")
+        return await message.reply_text(
+            f"🌐 **বর্তমানে পিং URL:** `{curr}`\n\n"
+            f"📝 **ব্যবহারের নিয়ম:** `/setping [সাইট URL]`\n"
+            f"💡 **উদাহরণ:** `/setping https://my-bot.koyeb.app`\n"
+            f"❌ বন্ধ করতে: `/setping off`"
+        )
+    url = args[1].strip()
+    if url.lower() in ["0", "off", "বন্ধ"]:
+        await settings_col.update_one({"_id": "config"}, {"$set": {"ping_url": None}}, upsert=True)
+        return await message.reply_text("✅ অটো-পিং সিস্টেম বন্ধ করা হয়েছে।")
+
+    if not (url.startswith("http://") or url.startswith("https://")):
+        url = f"https://{url}"
+
+    await settings_col.update_one({"_id": "config"}, {"$set": {"ping_url": url}}, upsert=True)
+    await message.reply_text(
+        f"✅ **অটো-পিং সাকসেসফুলি সেট হয়েছে!**\n\n"
+        f"🌐 URL: `{url}`\n"
+        f"⏱️ বট প্রতি **৩০ সেকেন্ড পর পর** এই লিংকে স্বয়ংক্রিয়ভাবে পিং করবে (Uptime Robot-এর মতো), ফলে বট কখনই স্লিপ মুডে যাবে না বা বন্ধ হবে না।"
+    )
+
 # ---------------- /setparvideo COMMAND (এক ক্লিকে কত ফাইল যাবে) ---------------- #
 @app.on_message(filters.command(["setparvideo", "setpervideo"]) & filters.user(OWNER_ID))
 async def setparvideo_handler(client: Client, message: Message):
@@ -526,13 +624,14 @@ async def help_handler(client: Client, message: Message):
     )
     admin_cmds = (
         "\n⚙️ **অ্যাডমিন কমান্ডসমূহ ও উদাহরণ:**\n\n"
+        "• `/setping https://mybot.koyeb.app` - ৩০ সেকেন্ড পর পর স্বয়ংক্রিয় আপটাইম পিং।\n"
         "• `/setcmd` - টেলিগ্রামের মেন্যুতে সব কমান্ডের লিস্ট বসানো\n"
         "• `/setparvideo 3` - প্রতি ক্লিকে একসাথে কতগুলো ফাইল যাবে তা সেট করা।\n"
         "• `/autodelet 30` - ৩০ সেকেন্ড পর অটো-ডিলিট সেট। বন্ধ করতে `/autodelet 0`\n"
         "• `/forward` - ফাইল ফরওয়ার্ড অপশন অন/অফ টগল।\n"
         "• `/setcategory নাটক -100123456789` - নতুন ক্যাটাগরি ও কমান্ড যুক্ত করা।\n"
         "• `/setgetfile -100123456789` - স্পেশাল getfile চ্যানেল সেট করা।\n"
-        "• `/setlink droplink.co api_key` - শর্টনার যুক্ত করা।\n"
+        "• `/setlink droplink.co api_key` - যেকোনো শর্টনার/ওয়ার্ডপ্রেস API যুক্ত করা।\n"
         "• `/deletlink` - শর্টনার লিংক ডিলিট করা।\n"
         "• `/mustjoine চ্যানেলনাম -100123456789` - মাস্ট জয়েন চ্যানেল অ্যাড করা।\n"
         "• `/addreedim 1440 5` - ১ দিনের ৫টি রিডিম কোড তৈরি।\n"
@@ -802,12 +901,13 @@ async def setlink_handler(client: Client, message: Message):
     if len(args) < 3:
         return await message.reply_text(
             "⚠️ **ভুল কমান্ড ফরম্যাট!**\n\n"
-            "📝 **ব্যবহারের নিয়ম:** `/setlink [domain] [api_key]`\n\n"
-            "💡 **উদাহরণ:**\n"
-            "• `/setlink droplink.co 98d6s8sd6f8sd6f`\n"
-            "• `/setlink shareus.io your_api_token`"
+            "📝 **ব্যবহারের নিয়ম:** `/setlink [domain/endpoint] [api_key]`\n\n"
+            "💡 **উদাহরণসমূহ:**\n"
+            "• AdLinkFly: `/setlink droplink.co 98d6s8sd6f8sd6f`\n"
+            "• WordPress সাইট: `/setlink mysite.com/api your_api_key`\n"
+            "• কাস্টম URL: `/setlink https://mysite.com/st?api= your_key`"
         )
-    domain = args[1].replace("https://", "").replace("http://", "").strip("/")
+    domain = args[1].strip()
     api = args[2].strip()
 
     await shorteners_col.update_one(
@@ -815,7 +915,7 @@ async def setlink_handler(client: Client, message: Message):
         {"$set": {"domain": domain, "api": api}},
         upsert=True
     )
-    await message.reply_text(f"✅ নতুন শর্টনার যুক্ত হয়েছে:\n🌐 ডোমেইন: `{domain}`\n🔑 এপিআই: `{api}`")
+    await message.reply_text(f"✅ নতুন শর্টনার সফলভাবে যুক্ত হয়েছে:\n🌐 ডোমেইন/এপিআই: `{domain}`\n🔑 এপিআই কী: `{api}`")
 
 @app.on_message(filters.command("deletlink") & filters.user(OWNER_ID))
 async def deletlink_handler(client: Client, message: Message):
@@ -960,7 +1060,7 @@ async def dynamic_command_listener(client: Client, message: Message):
                 "addreedim", "reedim", "deletpremium", "premiumlist", "setadmin", 
                 "setgetfile", "getfile", "broadcast", "setlink", "deletlink", 
                 "mustjoine", "setcategory", "setlogo", "setvideo", "index", 
-                "setparvideo", "setpervideo", "setcmd"]
+                "setparvideo", "setpervideo", "setcmd", "setping"]
     if cmd_text in reserved:
         return
 
@@ -1122,6 +1222,10 @@ async def main():
     bot_info = await app.get_me()
     print(f"🤖 Bot is Live: @{bot_info.username}")
     
+    # ব্যাকগ্রাউন্ডে স্বয়ংক্রিয় আপটাইম রোবট চালু (প্রতি ৩০ সেকেন্ড পর পর পিং করবে)
+    asyncio.create_task(auto_uptime_pinger())
+    print("🔄 30-Second Auto Uptime Pinger Task Started!")
+
     # বট রান হওয়ার সাথে সাথে মেন্যু কমান্ড সিঙ্ক হবে
     await sync_bot_commands(app)
     print("--------------------------------------------------")
