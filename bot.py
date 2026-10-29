@@ -6,7 +6,7 @@ import asyncio
 from datetime import datetime, timedelta
 import aiohttp
 from aiohttp import web
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.errors import (
     FloodWait, 
     UserNotParticipant, 
@@ -30,7 +30,8 @@ MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://FlixBixs:FlixBixs@cluster
 PORT = int(os.environ.get("PORT", "8080"))
 
 # ---------------- DATABASE CONNECTION ---------------- #
-mongo_client = AsyncIOMotorClient(MONGO_URI)
+# serverSelectionTimeoutMS দিয়ে ৫ সেকেন্ডে টাইমআউট করা হলো যাতে ডাটাবেজ ব্লক হলে ইনফিনিট ফ্রিজ না হয়
+mongo_client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 db = mongo_client["UltimateFileStoreBot"]
 
 users_col = db["users"]
@@ -47,7 +48,8 @@ app = Client(
     "UltimateFileStoreBot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
+    in_memory=True  # রেন্ডার/কোয়েবের ফাইল ডিলিট ইস্যু এড়াতে মেমোরি সেশন ব্যবহার করা হয়েছে
 )
 
 # ---------------- EMBEDDED WEB SERVER (FOR KOYEB & RENDER PORT BINDING) ---------------- #
@@ -60,6 +62,18 @@ async def web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
+
+# ---------------- FORCE WEBHOOK DELETION ---------------- #
+async def remove_webhook_if_exists():
+    """টেলিগ্রাম এপিআই থেকে সরাসরি যেকোনাে অ্যাক্টিভ ওয়েবহুক ডিলিট করবে"""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as resp:
+                res = await resp.json()
+                print(f"📡 Webhook Status Cleaned: {res.get('description', 'OK')}")
+    except Exception as e:
+        print(f"⚠️ Webhook removal error: {e}")
 
 # ---------------- CORE HELPER FUNCTIONS ---------------- #
 async def get_settings():
@@ -713,7 +727,7 @@ async def callback_router(client: Client, query: CallbackQuery):
                 )
 
         user_doc = await users_col.find_one({"_id": user_id})
-        current_pointer = user_doc.get("video_pointer", {}).get(str(cid), 1)
+        current_pointer = user_doc.get("video_pointer", {}).get(str(cid), 1) if user_doc else 1
         await query.message.delete()
         return await send_serial_video(client, user_id, cid, current_pointer)
 
@@ -788,15 +802,30 @@ async def callback_router(client: Client, query: CallbackQuery):
 # ---------------- MAIN APPLICATION ENTRY POINT ---------------- #
 async def main():
     print("--------------------------------------------------")
+    print("⏳ Testing MongoDB Connection...")
+    try:
+        await mongo_client.admin.command('ping')
+        print("✅ MongoDB Connected Successfully!")
+    except Exception as e:
+        print(f"❌ MongoDB Connection Failed! Check IP Whitelist (0.0.0.0/0) in Atlas. Error: {e}")
+        return
+
+    print("⚡ Checking and deleting active Webhooks...")
+    await remove_webhook_if_exists()
+
     print("⚡ Starting Koyeb / Render AioHTTP Port Server...")
     await web_server()
     print(f"✅ Web Server active on port {PORT}")
+
     print("⚡ Starting Telegram Bot Client...")
     await app.start()
     bot_info = await app.get_me()
     print(f"🤖 Bot is Live: @{bot_info.username}")
     print("--------------------------------------------------")
-    await asyncio.Event().wait()
+    
+    # পাইরোগ্রামের সঠিক ইভেন্ট লুপ লিসেনার (যাতে কোনো কমান্ড মিস না হয়)
+    await idle()
+    await app.stop()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    app.run(main())
