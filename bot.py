@@ -18,7 +18,8 @@ from pyrogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
-    CallbackQuery
+    CallbackQuery,
+    BotCommand
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -31,6 +32,7 @@ MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://FlixBixs:FlixBixs@cluster
 PORT = int(os.environ.get("PORT", "8080"))
 
 # ---------------- DATABASE CONNECTION ---------------- #
+# serverSelectionTimeoutMS দিয়ে ৫ সেকেন্ডে টাইমআউট করা হলো যাতে ডাটাবেজ ব্লক হলে ইনফিনিট ফ্রিজ না হয়
 mongo_client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 db = mongo_client["UltimateFileStoreBot"]
 
@@ -49,10 +51,10 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    in_memory=True
+    in_memory=True  # রেন্ডার/কোয়েবের ফাইল ডিলিট ইস্যু এড়াতে মেমোরি সেশন ব্যবহার করা হয়েছে
 )
 
-# ---------------- EMBEDDED WEB SERVER (KOYEB/RENDER COMPATIBLE) ---------------- #
+# ---------------- EMBEDDED WEB SERVER (FOR KOYEB & RENDER PORT BINDING) ---------------- #
 async def web_server():
     async def handle_ping(request):
         return web.Response(text="Bot is running smoothly on Koyeb/Render!")
@@ -65,6 +67,7 @@ async def web_server():
 
 # ---------------- FORCE WEBHOOK DELETION ---------------- #
 async def remove_webhook_if_exists():
+    """টেলিগ্রাম এপিআই থেকে সরাসরি যেকোনাে অ্যাক্টিভ ওয়েবহুক ডিলিট করবে"""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true"
     try:
         async with aiohttp.ClientSession() as session:
@@ -87,7 +90,7 @@ async def get_settings():
             "protect_content": False,
             "getfile_channel": None,
             "auto_delete_time": 0,
-            "files_per_request": 1  # ডিফল্টভাবে প্রতি ক্লিকে ১টি ফাইল
+            "files_per_request": 1  # ডিফল্টভাবে প্রতি ক্লিকে ১টি করে ফাইল যাবে
         }
         await settings_col.insert_one(default)
         return default
@@ -116,9 +119,41 @@ async def is_premium_user(user_id: int) -> bool:
         return True
     return False
 
+async def is_verified_user(user_id: int) -> bool:
+    if await is_premium_user(user_id):
+        return True
+    user = await users_col.find_one({"_id": user_id})
+    if not user:
+        return False
+    v_until = user.get("verified_until")
+    if v_until and v_until > datetime.utcnow():
+        return True
+    return False
+
 def slugify_command(text: str) -> str:
+    """যেকোনো টেক্সটকে টেলিগ্রাম স্ল্যাশ কমান্ডের উপযোগী স্ট্রিং-এ রূপান্তর করে"""
     clean = re.sub(r'[^a-zA-Z0-9_]', '', text.lower().replace(" ", "_"))
     return clean if clean else "file"
+
+# ---------------- TELEGRAM BOT COMMANDS MENU SYNC ---------------- #
+async def sync_bot_commands(client: Client):
+    """বটের সকল সাধারণ ও ক্যাটাগরি কমান্ড টেলিগ্রাম মেন্যুতে সেট করে"""
+    cmds = [
+        BotCommand("start", "বট চালু করুন ও মূল মেন্যু দেখুন"),
+        BotCommand("help", "সাহায্য ও সকল কমান্ডের উদাহরণ"),
+        BotCommand("skip", "নির্দিষ্ট পর্ব থেকে দেখা শুরু করুন"),
+        BotCommand("reedim", "প্রিমিয়াম মেম্বারশিপ রিডিম কোড ব্যবহার"),
+    ]
+    # সকল ক্যাটাগরির নিজস্ব কমান্ড যুক্ত করা
+    async for cat in categories_col.find():
+        cmd = cat.get("cmd", slugify_command(cat["name"]))
+        cmds.append(BotCommand(cmd, f"{cat['name']} ফাইলসমূহ"))
+
+    try:
+        await client.set_bot_commands(cmds)
+        print("✅ Telegram Bot Commands Menu Synced!")
+    except Exception as e:
+        print(f"⚠️ Failed to sync commands: {e}")
 
 # ---------------- AUTO-DELETE BACKGROUND TASK ---------------- #
 async def auto_delete_task(client: Client, chat_id: int, message_ids: list, delay_sec: int, notice_id: int = None):
@@ -190,7 +225,7 @@ async def generate_shortlink(user_id: int, bot_username: str, action: str = "gen
         print(f"Shortlink API Error: {e}")
     return long_url, token
 
-# ---------------- BATCH & SEQUENTIAL FILE SENDER (NO BUTTONS AT ALL) ---------------- #
+# ---------------- BATCH & SEQUENTIAL FILE SENDER (NO BUTTONS, PURE FILE) ---------------- #
 async def send_batch_serial_videos(client: Client, user_id: int, channel_id: int, start_serial: int):
     settings = await get_settings()
     protect = settings.get("protect_content", False)
@@ -199,7 +234,7 @@ async def send_batch_serial_videos(client: Client, user_id: int, channel_id: int
 
     total_videos = await files_col.count_documents({"channel_id": channel_id})
     if total_videos == 0:
-        return await client.send_message(user_id, "⚠️ এই ক্যাটাগরিতে এখনো কোনো ফাইল বা ভিডিও আপলোড করা হয়নি!")
+        return await client.send_message(user_id, "⚠️ এই ক্যাটাগরিতে এখনো কোনো ফাইল বা ভিডিও ইনডেক্স করা হয়নি! এডমিনকে বলুন `/index` কমান্ড দিতে।")
 
     if start_serial < 1:
         start_serial = 1
@@ -209,16 +244,14 @@ async def send_batch_serial_videos(client: Client, user_id: int, channel_id: int
     sent_message_ids = []
     current_num = start_serial
 
-    # লুপের মাধ্যমে এক ক্লিকে যতগুলো ফাইল সেট করা হয়েছে ততগুলো ফাইল পাঠানো হবে
+    # এক ক্লিকে যতগুলো ফাইল সেট করা হয়েছে ততগুলো একসাথে পাঠানো হবে (হোম, নেক্সট, প্রিভিয়াস বাটন ছাড়া)
     for i in range(batch_count):
-        # পর্বের নম্বর মোট ভিডিও পার হলে আবার ১ থেকে শুরু হবে
         target_serial = ((current_num - 1 + i) % total_videos) + 1
         video_doc = await files_col.find_one({"channel_id": channel_id, "serial": target_serial})
         
         if video_doc:
             try:
                 caption_text = f"🎬 **পর্ব: {target_serial}/{total_videos}**\n\n{video_doc.get('caption', '')}"
-                # কোনো বাটন (Next/Prev/Home) ছাড়া সরাসরি মেসেজ ডেলিভারি
                 sent_msg = await client.copy_message(
                     chat_id=user_id,
                     from_chat_id=channel_id,
@@ -227,9 +260,9 @@ async def send_batch_serial_videos(client: Client, user_id: int, channel_id: int
                     protect_content=protect
                 )
                 sent_message_ids.append(sent_msg.id)
-                await asyncio.sleep(0.6)  # টেলিগ্রাম ফ্লাডওয়েট এড়াতে বিরতি
+                await asyncio.sleep(0.6)  # টেলিগ্রাম ফ্লাডওয়েট এড়াতে সুরক্ষা বিরতি
             except Exception as e:
-                print(f"Error sending file serial {target_serial}: {e}")
+                print(f"File send error (serial {target_serial}): {e}")
 
     # ইউজারের পরবর্তী পয়েন্টার স্বয়ংক্রিয়ভাবে ব্যাচ অনুযায়ী আপডেট হবে
     next_pointer = ((current_num - 1 + batch_count) % total_videos) + 1
@@ -238,11 +271,11 @@ async def send_batch_serial_videos(client: Client, user_id: int, channel_id: int
         {"$set": {f"video_pointer.{channel_id}": next_pointer}}
     )
 
-    # অটো ডিলিট টাইমার কার্যকর করা (সকল ফাইলের জন্য)
+    # অটো ডিলিট কার্যকর করা
     if auto_del and auto_del > 0 and sent_message_ids:
         notice = await client.send_message(
             chat_id=user_id,
-            text=f"⏳ **সতর্কবার্তা:** পাঠানো ফাইলগুলো আগামী **{auto_del} সেকেন্ড** পর স্বয়ংক্রিয়ভাবে মুছে যাবে!"
+            text=f"⏳ **সতর্কবার্তা:** এই ফাইলগুলো আগামী **{auto_del} সেকেন্ড** পর স্বয়ংক্রিয়ভাবে মুছে যাবে!"
         )
         asyncio.create_task(auto_delete_task(client, user_id, sent_message_ids, auto_del, notice.id))
 
@@ -255,41 +288,49 @@ async def handle_category_request(client: Client, user_id: int, channel_id: int,
     user_doc = await users_col.find_one({"_id": user_id})
     current_pointer = user_doc.get("video_pointer", {}).get(str(channel_id), 1) if user_doc else 1
 
-    # ফ্রি ইউজার হলে প্রতিবারই বাধ্যতামূলক ভেরিফাই লিংক আসবে (ইনকাম নিশ্চিতকরণ)
+    # সাধারণ ইউজার হলে প্রতিবারই বাধ্যতামূলক ভেরিফাই লিংক আসবে (বিজ্ঞাপন ইনকাম নিশ্চিতকরণ)
     if not is_premium:
         me = await client.get_me()
         short_url, _ = await generate_shortlink(user_id, me.username, action=f"cat_{channel_id}")
         if short_url:
             btn = InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"🔓 {batch_count}টি ফাইল আনলক করুন (ভেরিফাই লিংক)", url=short_url)],
-                [InlineKeyboardButton("💎 সরাসরি প্রিমিয়াম নিন (বিজ্ঞাপনহীন)", url=f"https://t.me/{settings['admin_contact'].replace('@', '')}")]
+                [InlineKeyboardButton(f"🔓 {batch_count}টি ফাইল আনলক করুন", url=short_url)],
+                [InlineKeyboardButton("💎 প্রিমিয়াম নিন (বিজ্ঞাপনহীন)", url=f"https://t.me/{settings['admin_contact'].replace('@', '')}")]
             ])
             text = (
-                f"🔒 **{current_pointer} নম্বর পর্ব থেকে মোট {batch_count}টি ফাইল আনলক করতে ভেরিফাই করুন!**\n\n"
-                "👉 নিচের লিংকে গিয়ে ভেরিফিকেশন সম্পন্ন করলেই ফাইলগুলো আপনার ইনবক্সে চলে আসবে।\n"
-                "💡 *পরবর্তী পর্বগুলো পেতে পুনরায় ক্যাটাগরিতে ক্লিক করবেন বা কমান্ড দেবেন।*\n"
+                f"🔒 **{current_pointer} নম্বর পর্ব থেকে মোট {batch_count}টি ফাইল দেখতে ভেরিফাই করুন!**\n\n"
+                "👉 নিচের লিংকে গিয়ে ভেরিফিকেশন সম্পন্ন করলেই ফাইল সাথে সাথে ইনবক্সে চলে আসবে।\n"
                 "💎 প্রিমিয়াম মেম্বারদের কোনো বিজ্ঞাপন বা ভেরিফাই করতে হয় না।"
             )
             if isinstance(message_or_query, CallbackQuery):
                 return await message_or_query.message.reply_text(text, reply_markup=btn)
             return await message_or_query.reply_text(text, reply_markup=btn)
 
-    # প্রিমিয়াম হলে সরাসরি ভিডিওগুলো পাবে
-    if isinstance(message_or_query, CallbackQuery):
-        try:
-            await message_or_query.message.delete()
-        except Exception:
-            pass
+    # প্রিমিয়াম হলে সরাসরি ভিডিও পাবে (স্টার্ট মেন্যুর বাটন কখনই ডিলিট হবে না)
     await send_batch_serial_videos(client, user_id, channel_id, current_pointer)
 
 async def handle_special_getfile_request(client: Client, user_id: int, message_or_query):
+    """গেটফাইল চ্যানেলের ফাইল হ্যান্ডলিং"""
+    # প্রথমে চেক করবে getfile নামে কোনো ক্যাটাগরি তৈরি আছে কিনা
+    cat = await categories_col.find_one({"cmd": "getfile"})
+    if not cat:
+        cat = await categories_col.find_one({"name": {"$regex": "^getfile$", "$options": "i"}})
+
+    if cat:
+        return await handle_category_request(client, user_id, cat["channel_id"], message_or_query)
+
     settings = await get_settings()
     protect = settings.get("protect_content", False)
     auto_del = settings.get("auto_delete_time", 0)
     getfile_cid = settings.get("getfile_channel")
 
     if not getfile_cid:
-        err = "⚠️ GetFile চ্যানেল এখনো সেট করা হয়নি! সেট করতে অ্যাডমিন লিখুন: `/setgetfile -100xxxxxxxxxx`"
+        err = (
+            "⚠️ GetFile চ্যানেল এখনো সেট করা হয়নি!\n\n"
+            "💡 **সমাধান:**\n"
+            "১. হয় লিখুন: `/setgetfile -100xxxxxxxxxx`\n"
+            "২. অথবা ক্যাটাগরি হিসেবে যুক্ত করুন: `/setcategory getfile -100xxxxxxxxxx`"
+        )
         if isinstance(message_or_query, CallbackQuery):
             return await message_or_query.answer(err, show_alert=True)
         return await message_or_query.reply_text(err)
@@ -301,7 +342,7 @@ async def handle_special_getfile_request(client: Client, user_id: int, message_o
         if short_url:
             btn = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔓 স্পেশাল ফাইল আনলক করুন", url=short_url)],
-                [InlineKeyboardButton("💎 সরাসরি প্রিমিয়াম নিন (বিজ্ঞাপনহীন)", url=f"https://t.me/{settings['admin_contact'].replace('@', '')}")]
+                [InlineKeyboardButton("💎 প্রিমিয়াম নিন (বিজ্ঞাপনহীন)", url=f"https://t.me/{settings['admin_contact'].replace('@', '')}")]
             ])
             text = (
                 "🔒 **স্পেশাল ফাইল পেতে হলে একটি ভেরিফিকেশন সম্পন্ন করুন!**\n\n"
@@ -331,7 +372,7 @@ async def handle_special_getfile_request(client: Client, user_id: int, message_o
             return await message_or_query.reply_text(msg)
 
         if isinstance(message_or_query, CallbackQuery):
-            await message_or_query.answer("✅ স্পেশাল ফাইল পাঠানো হয়েছে!", show_alert=False)
+            await message_or_query.answer("✅ ফাইল পাঠানো হয়েছে!", show_alert=False)
     except Exception as e:
         err = f"❌ এরর: {str(e)}"
         if isinstance(message_or_query, CallbackQuery):
@@ -395,22 +436,21 @@ async def start_handler(client: Client, message: Message):
         f"👤 **আপনার প্রোফাইল তথ্য:**\n"
         f"├ **নাম:** {user.first_name} {user.last_name or ''}\n"
         f"├ **ইউজারনেম:** @{user.username if user.username else 'N/A'}\n"
-        f"└ **ইউজার আইডি:** `{user.id}`\n\n"
-        f"⭐ **স্ট্যাটাস:** {'💎 প্রিমিয়াম মেম্বার' if await is_premium_user(user.id) else '🆓 সাধারণ ইউজার'}\n"
+        f"├ **ইউজার আইডি:** `{user.id}`\n"
+        f"└ **স্ট্যাটাস:** {'💎 প্রিমিয়াম মেম্বার' if await is_premium_user(user.id) else '🆓 সাধারণ ইউজার'}\n\n"
         f"📦 **প্রতি ক্লিকে ডেলিভারি:** `{per_v} টি ফাইল`\n\n"
         f"📂 নিচের বাটন থেকে অথবা সরাসরি স্ল্যাশ কমান্ড দিয়ে ফাইল বেছে নিন:"
     )
 
     buttons = []
 
-    # GetFile Button
+    # GetFile Button (যদি স্পেশাল গেটফাইল চ্যানেল থাকে)
     if settings.get("getfile_channel"):
         buttons.append([InlineKeyboardButton("🌟 স্পেশাল ফাইল (Get Files)", callback_data="special_getfile")])
 
-    # Dynamic Category Buttons
+    # Dynamic Category Buttons (বাটনে শুধুই নাম থাকবে, কোনো অতিরিক্ত স্ল্যাশ বা ব্র্যাকেট থাকবে না)
     async for cat in categories_col.find():
-        cmd_hint = f" (/{cat.get('cmd', 'cat')})" if cat.get('cmd') else ""
-        buttons.append([InlineKeyboardButton(f"📁 {cat['name']}{cmd_hint}", callback_data=f"playcat_{cat['channel_id']}")])
+        buttons.append([InlineKeyboardButton(f"📁 {cat['name']}", callback_data=f"playcat_{cat['channel_id']}")])
 
     # Tutorial Video Button
     if settings.get("video_btn_url"):
@@ -430,6 +470,17 @@ async def start_handler(client: Client, message: Message):
 
     await message.reply_text(text=caption, reply_markup=keyboard)
 
+# ---------------- /setcmd COMMAND (অটোমেটিক সকল কমান্ড টেলিগ্রাম মেনুতে বসানো) ---------------- #
+@app.on_message(filters.command("setcmd") & filters.user(OWNER_ID))
+async def setcmd_handler(client: Client, message: Message):
+    status = await message.reply_text("⏳ টেলিগ্রাম মেন্যুতে সকল কমান্ড সেট করা হচ্ছে...")
+    await sync_bot_commands(client)
+    await status.edit_text(
+        "✅ **সফল হয়েছে!**\n"
+        "বটের সকল সাধারণ কমান্ড এবং আপনার তৈরি করা সকল ক্যাটাগরি কমান্ড টেলিগ্রামের মেনুতে বসে গেছে।\n"
+        "এখন চ্যাটে যেকোনো ইউজার `/` চাপলেই কমান্ডগুলোর তালিকা দেখতে পাবে।"
+    )
+
 # ---------------- /setparvideo COMMAND (এক ক্লিকে কত ফাইল যাবে) ---------------- #
 @app.on_message(filters.command(["setparvideo", "setpervideo"]) & filters.user(OWNER_ID))
 async def setparvideo_handler(client: Client, message: Message):
@@ -442,9 +493,9 @@ async def setparvideo_handler(client: Client, message: Message):
             f"⚠️ **ব্যবহারের সঠিক নিয়ম:**\n"
             f"`/setparvideo [ফাইলের সংখ্যা]`\n\n"
             f"💡 **উদাহরণ:**\n"
-            f"• প্রতি ক্লিকে ৩টি করে ফাইল দিতে: `/setparvideo 3`\n"
-            f"• প্রতি ক্লিকে ৫টি করে ফাইল দিতে: `/setparvideo 5`\n"
-            f"• প্রতি ক্লিকে ১টি করে ফাইল দিতে: `/setparvideo 1`"
+            f"• প্রতি ক্লিকে ২টি ফাইল দিতে: `/setparvideo 2`\n"
+            f"• প্রতি ক্লিকে ৩টি ফাইল দিতে: `/setparvideo 3`\n"
+            f"• প্রতি ক্লিকে ৫টি ফাইল দিতে: `/setparvideo 5`"
         )
 
     count = int(args[1])
@@ -468,13 +519,14 @@ async def help_handler(client: Client, message: Message):
         "   └ 💡 উদাহরণ: `/skip 10`\n"
         "3️⃣ `/reedim [কোড]` - প্রিমিয়াম কোড রিডিম করা।\n"
         "   └ 💡 উদাহরণ: `/reedim PREM-ABC12345`\n"
-        "4️⃣ `/getfile` - সরাসরি স্পেশাল ফাইল নেওয়া।\n"
+        "4️⃣ `/getfile` - সরাসরি স্পেশাল ফাইল বা getfile ক্যাটাগরি নেওয়া।\n"
         "   └ 💡 উদাহরণ: `/getfile`\n"
         "5️⃣ `/[ক্যাটাগরি_নাম]` - ক্যাটাগরির নামে সরাসরি স্ল্যাশ কমান্ড দিয়ে ফাইল নেওয়া।\n"
         "   └ 💡 উদাহরণ: `/natok` অথবা `/movie`\n"
     )
     admin_cmds = (
         "\n⚙️ **অ্যাডমিন কমান্ডসমূহ ও উদাহরণ:**\n\n"
+        "• `/setcmd` - টেলিগ্রামের মেন্যুতে সব কমান্ডের লিস্ট বসানো\n"
         "• `/setparvideo 3` - প্রতি ক্লিকে একসাথে কতগুলো ফাইল যাবে তা সেট করা।\n"
         "• `/autodelet 30` - ৩০ সেকেন্ড পর অটো-ডিলিট সেট। বন্ধ করতে `/autodelet 0`\n"
         "• `/forward` - ফাইল ফরওয়ার্ড অপশন অন/অফ টগল।\n"
@@ -677,7 +729,7 @@ async def setadmin_handler(client: Client, message: Message):
     await settings_col.update_one({"_id": "config"}, {"$set": {"admin_contact": adm}}, upsert=True)
     await message.reply_text(f"✅ প্রিমিয়াম কেনার জন্য অ্যাডমিন কন্টাক্ট সেট হয়েছে: `{adm}`")
 
-# ---------------- /setgetfile & /getfile ---------------- #
+# ---------------- /setgetfile & /getfile (FIXED FOR BOTH SPECIAL & CATEGORY) ---------------- #
 @app.on_message(filters.command("setgetfile") & filters.user(OWNER_ID))
 async def setgetfile_handler(client: Client, message: Message):
     args = message.text.split()
@@ -704,6 +756,7 @@ async def getfile_cmd_handler(client: Client, message: Message):
             "⚠️ ফাইলটি পাওয়ার পূর্বে আমাদের চ্যানেলগুলোতে জয়েন করুন:",
             reply_markup=get_must_join_markup(unjoined)
         )
+    # প্রথমে ক্যাটাগরি খুঁজবে, না পেলে স্পেশাল চ্যানেল খুঁজবে
     await handle_special_getfile_request(client, user_id, message)
 
 # ---------------- /broadcast COMMAND ---------------- #
@@ -821,21 +874,23 @@ async def setcat_handler(client: Client, message: Message):
                 {"$set": {"name": cat_name, "cmd": clean_slug, "channel_id": cid}},
                 upsert=True
             )
+            # মেন্যুর কমান্ডগুলো আপডেট করে দেওয়া
+            asyncio.create_task(sync_bot_commands(client))
+
             return await message.reply_text(
-                f"✅ **ক্যাটাগরি এবং কমান্ড সফলভাবে তৈরি হয়েছে!**\n\n"
+                f"✅ **ক্যাটাগরি এবং স্ল্যাশ কমান্ড সফলভাবে তৈরি হয়েছে!**\n\n"
                 f"📁 নাম: `{cat_name}`\n"
                 f"⚡ কমান্ড: `/{clean_slug}`\n"
                 f"🆔 চ্যানেল আইডি: `{cid}`\n\n"
                 f"👉 এখন থেকে ইউজাররা বাটনে ক্লিক করলেও পাবে, আবার সরাসরি `/{clean_slug}` লিখলেও ফাইল পাবে।"
             )
         except ValueError:
-            return await message.reply_text("⚠️ চ্যানেল আইডি পূর্ণসংখ্যা হতে হবে!\n💡 উদাহরণ: `/setcategory Natok -1001234567890`")
+            return await message.reply_text("⚠️ চ্যানেল আইডি পূর্ণসংখ্যা হতে হবে!\n💡 উদাহরণ: `/setcategory getfile -1001234567890`")
 
     buttons = []
     async for cat in categories_col.find():
-        cmd_txt = f" (/{cat.get('cmd', 'cmd')})"
         buttons.append([
-            InlineKeyboardButton(f"📁 {cat['name']}{cmd_txt}", callback_data=f"playcat_{cat['channel_id']}"),
+            InlineKeyboardButton(f"📁 {cat['name']}", callback_data=f"playcat_{cat['channel_id']}"),
             InlineKeyboardButton("❌ মুছুন", callback_data=f"delcat_{cat['channel_id']}")
         ])
     if not buttons:
@@ -905,7 +960,7 @@ async def dynamic_command_listener(client: Client, message: Message):
                 "addreedim", "reedim", "deletpremium", "premiumlist", "setadmin", 
                 "setgetfile", "getfile", "broadcast", "setlink", "deletlink", 
                 "mustjoine", "setcategory", "setlogo", "setvideo", "index", 
-                "setparvideo", "setpervideo"]
+                "setparvideo", "setpervideo", "setcmd"]
     if cmd_text in reserved:
         return
 
@@ -958,7 +1013,6 @@ async def callback_router(client: Client, query: CallbackQuery):
     if data == "check_join_again":
         is_joined, unjoined = await check_must_join(client, user_id)
         if is_joined:
-            await query.message.delete()
             return await start_handler(client, query.message)
         else:
             return await query.answer("❌ আপনি এখনো সব চ্যানেলে জয়েন করেননি! সবগুলোতে জয়েন করে আবার চাপ দিন।", show_alert=True)
@@ -966,7 +1020,7 @@ async def callback_router(client: Client, query: CallbackQuery):
     # Force Sub Check
     is_joined, unjoined = await check_must_join(client, user_id)
     if not is_joined:
-        return await query.message.edit_text(
+        return await query.message.reply_text(
             "⚠️ আপনি চ্যানেলগুলো থেকে লিভ নিয়েছেন! বট ব্যবহার করতে আবার জয়েন করুন:",
             reply_markup=get_must_join_markup(unjoined)
         )
@@ -976,6 +1030,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         cid = int(data.split("_")[1])
         await categories_col.delete_one({"channel_id": cid})
         await files_col.delete_many({"channel_id": cid})
+        asyncio.create_task(sync_bot_commands(client))
         await query.answer("🗑️ ক্যাটাগরি ও এর ভিডিও রেকর্ড মুছে ফেলা হয়েছে!", show_alert=True)
         return await query.message.delete()
 
@@ -1000,24 +1055,24 @@ async def callback_router(client: Client, query: CallbackQuery):
         pos = int(pos_str)
         await users_col.update_one({"_id": user_id}, {"$set": {f"video_pointer.{cid}": pos}})
         await query.answer("✅ আপনার স্কিপ সফলভাবে সেট হয়েছে!", show_alert=True)
-        await query.message.edit_text(f"🎯 আপনার স্কিপ পয়েন্ট সেট করা হয়েছে **{pos}** নম্বর ভিডিওতে।")
+        await query.message.reply_text(f"🎯 আপনার স্কিপ পয়েন্ট সেট করা হয়েছে **{pos}** নম্বর ভিডিওতে।")
         return await handle_category_request(client, user_id, cid, query)
 
-    # ক্যাটাগরি বাটন থেকে ভিডিও প্লে
+    # ক্যাটাগরি বাটন থেকে ভিডিও প্লে (স্টার্ট মেন্যুর বাটন কখনই ডিলিট হবে না)
     elif data.startswith("playcat_"):
         cid = int(data.split("_")[1])
-        await query.answer()
+        await query.answer("ফাইল প্রস্তুত করা হচ্ছে...")
         return await handle_category_request(client, user_id, cid, query)
 
     # স্পেশাল গেটফাইল বাটন
     elif data == "special_getfile":
-        await query.answer()
+        await query.answer("ফাইল প্রস্তুত করা হচ্ছে...")
         return await handle_special_getfile_request(client, user_id, query)
 
     # চ্যানেল ইন্ডেক্সিং
     elif data.startswith("idx_"):
         cid = int(data.split("_")[1])
-        status = await query.message.edit_text("⏳ চ্যানেলের ফাইলগুলো ক্রমানুসারে সাজিয়ে ডাটাবেজে ইন্ডেক্স করা হচ্ছে, অপেক্ষা করুন...")
+        status = await query.message.reply_text("⏳ চ্যানেলের ফাইলগুলো ক্রমানুসারে সাজিয়ে ডাটাবেজে ইন্ডেক্স করা হচ্ছে, অপেক্ষা করুন...")
         total_indexed = 0
 
         await files_col.delete_many({"channel_id": cid})
@@ -1044,11 +1099,6 @@ async def callback_router(client: Client, query: CallbackQuery):
 
         await status.edit_text(f"✅ মোট **{total_indexed}** টি ফাইল ১ থেকে {total_indexed} পর্যন্ত সিরিয়াল অনুযায়ী ইন্ডেক্স সম্পন্ন হয়েছে!")
 
-    # ব্যাক টু হোম
-    elif data == "back_start":
-        await query.message.delete()
-        await start_handler(client, query.message)
-
 # ---------------- MAIN APPLICATION ENTRY POINT ---------------- #
 async def main():
     print("--------------------------------------------------")
@@ -1071,6 +1121,9 @@ async def main():
     await app.start()
     bot_info = await app.get_me()
     print(f"🤖 Bot is Live: @{bot_info.username}")
+    
+    # বট রান হওয়ার সাথে সাথে মেন্যু কমান্ড সিঙ্ক হবে
+    await sync_bot_commands(app)
     print("--------------------------------------------------")
     
     await idle()
